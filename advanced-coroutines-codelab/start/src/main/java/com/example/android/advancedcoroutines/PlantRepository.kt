@@ -16,8 +16,25 @@
 
 package com.example.android.advancedcoroutines
 
+import androidx.annotation.AnyThread
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.liveData
+import androidx.lifecycle.map
+import androidx.lifecycle.switchMap
+import com.example.android.advancedcoroutines.util.CacheOnSuccess
+import com.example.android.advancedcoroutines.utils.ComparablePair
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.asFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.withContext
 
 /**
  * Repository module for handling data operations.
@@ -34,11 +51,50 @@ class PlantRepository private constructor(
     private val defaultDispatcher: CoroutineDispatcher = Dispatchers.Default
 ) {
 
+    private var plantsListSortOrderCache =
+        CacheOnSuccess(onErrorFallback = { listOf<String>() }) {
+            plantService.customPlantSortOrder()
+        }
+
+    private val customSortFlow = plantsListSortOrderCache::getOrAwait.asFlow()
+
+    val plantsFlow: Flow<List<Plant>>
+        get() = plantDao.getPlantsFlow()
+            .combine(customSortFlow) { plants, sortOrder ->
+                plants.applySort(sortOrder)
+            }
+            .flowOn(defaultDispatcher)
+            .conflate()
+
+    fun getPlantsWithGrowZoneFlow(growZone: GrowZone): Flow<List<Plant>> {
+        return plantDao.getPlantsWithGrowZoneNumberFlow(growZone.number)
+            .map { plantList ->
+                val sortOrderFromNetwork = plantsListSortOrderCache.getOrAwait()
+                val nextValue = plantList.applyMainSafeSort(sortOrderFromNetwork)
+                nextValue
+            }
+    }
+
     /**
      * Fetch a list of [Plant]s from the database.
      * Returns a LiveData-wrapped List of Plants.
      */
-    val plants = plantDao.getPlants()
+    val plants: LiveData<List<Plant>> = liveData<List<Plant>> {
+        val plantsLiveData = plantDao.getPlants()
+        val customSortOrder = plantsListSortOrderCache.getOrAwait()
+        emitSource(plantsLiveData.map { plantList ->
+            plantList.applySort(customSortOrder)
+        })
+    }
+
+    private fun List<Plant>.applySort(customSortOrder: List<String>): List<Plant> {
+        return sortedBy { plant ->
+            val positionForItem = customSortOrder.indexOf(plant.plantId).let { order ->
+                if (order > -1) order else Int.MAX_VALUE
+            }
+            ComparablePair(positionForItem, plant.name)
+        }
+    }
 
     /**
      * Fetch a list of [Plant]s from the database that matches a given [GrowZone].
@@ -46,6 +102,18 @@ class PlantRepository private constructor(
      */
     fun getPlantsWithGrowZone(growZone: GrowZone) =
         plantDao.getPlantsWithGrowZoneNumber(growZone.number)
+            .switchMap { plantList ->
+                liveData {
+                    val customSortOrder = plantsListSortOrderCache.getOrAwait()
+                    emit(plantList.applyMainSafeSort(customSortOrder))
+                }
+            }
+
+    @AnyThread
+    suspend fun List<Plant>.applyMainSafeSort(customSortOrder: List<String>) =
+        withContext(defaultDispatcher) {
+            this@applyMainSafeSort.applySort(customSortOrder)
+        }
 
     /**
      * Returns true if we should make a network request.
